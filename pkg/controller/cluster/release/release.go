@@ -20,13 +20,14 @@ import (
 	"context"
 	"time"
 
-	"github.com/pkg/errors"
+	"github.com/crossplane/crossplane-runtime/v2/pkg/errors"
 	"helm.sh/helm/v3/pkg/chart"
 	"helm.sh/helm/v3/pkg/release"
 	"helm.sh/helm/v3/pkg/storage/driver"
 	corev1 "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -75,8 +76,7 @@ const (
 	errFailedToTrackUsage         = "cannot track provider config usage"
 	errFailedToLoadPatches        = "failed to load patches"
 	errFailedToUpdatePatchSha     = "failed to update patch sha"
-	errFailedToSetName            = "failed to update chart spec with the name from URL"
-	errFailedToSetVersion         = "failed to update chart spec with the latest version"
+	errFailedToLateInitialize     = "failed to update chart spec with late-initialized values"
 	errFailedToCreateNamespace    = "failed to create namespace for release"
 )
 
@@ -154,6 +154,10 @@ func withRelease(cr *v1beta1.Release) helmClient.ArgsApplier {
 		config.SkipCRDs = cr.Spec.ForProvider.SkipCRDs
 		config.InsecureSkipTLSVerify = cr.Spec.ForProvider.InsecureSkipTLSVerify
 		config.PlainHTTP = cr.Spec.ForProvider.PlainHTTP
+		// Only use TakeOwnership if requested AND not already used
+		// This prevents silent adoption of resources during upgrades after initial adoption
+		config.TakeOwnership = cr.Spec.ForProvider.TakeOwnership && !cr.Status.AtProvider.OwnershipTaken
+		config.MaxHistory = cr.Spec.ForProvider.MaxHistory
 	}
 }
 
@@ -224,7 +228,12 @@ func (e *helmExternal) Observe(ctx context.Context, mg resource.Managed) (manage
 		return managed.ExternalObservation{}, errors.New(errLastReleaseIsNil)
 	}
 
+	// Preserve the last-deployed digest from the persisted status so isUpToDate
+	// can detect spec.digest changes. generateObservation reconstructs the
+	// observation from the Helm release, which has no notion of OCI digest.
+	lastDigest := cr.Status.AtProvider.Digest
 	cr.Status.AtProvider = generateObservation(rel)
+	cr.Status.AtProvider.Digest = lastDigest
 
 	// Determining whether the release is up to date may involve reading values
 	// from secrets, configmaps, etc. This will fail if said dependencies have
@@ -248,6 +257,9 @@ func (e *helmExternal) Observe(ctx context.Context, mg resource.Managed) (manage
 		if err != nil {
 			return managed.ExternalObservation{}, errors.Wrap(err, "cannot get connection details")
 		}
+		if cr.Status.AtProvider.Digest == "" {
+			cr.Status.AtProvider.Digest = cr.Spec.ForProvider.Chart.Digest
+		}
 		cr.Status.SetConditions(xpv1.Available())
 	} else {
 		cr.Status.SetConditions(xpv1.Unavailable())
@@ -262,7 +274,7 @@ func (e *helmExternal) Observe(ctx context.Context, mg resource.Managed) (manage
 
 type deployAction func(release string, chart *chart.Chart, vals map[string]interface{}, patches []ktype.Patch) (*release.Release, error)
 
-func (e *helmExternal) deploy(ctx context.Context, cr *v1beta1.Release, action deployAction) error {
+func (e *helmExternal) deploy(ctx context.Context, cr *v1beta1.Release, action deployAction) error { //nolint:gocyclo // easier to follow as a unit
 	cv, err := composeValuesFromSpec(ctx, e.localKube, cr.Spec.ForProvider.ValuesSpec)
 	if err != nil {
 		return errors.Wrap(err, errFailedToComposeValues)
@@ -283,16 +295,31 @@ func (e *helmExternal) deploy(ctx context.Context, cr *v1beta1.Release, action d
 	if err != nil {
 		return err
 	}
-	if cr.Spec.ForProvider.Chart.Name == "" {
-		cr.Spec.ForProvider.Chart.Name = chart.Metadata.Name
-		if err := e.localKube.Update(ctx, cr); err != nil {
-			return errors.Wrap(err, errFailedToSetName)
+
+	// Check if LateInitialize is allowed by management policies
+	mp := sets.New[xpv1.ManagementAction](cr.Spec.ManagementPolicies...)
+	shouldLateInit := len(mp) == 0 || mp.HasAny(xpv1.ManagementActionLateInitialize, xpv1.ManagementActionAll)
+
+	needsUpdate := false
+	if shouldLateInit {
+		if cr.Spec.ForProvider.Chart.Name == "" {
+			cr.Spec.ForProvider.Chart.Name = chart.Metadata.Name
+			needsUpdate = true
 		}
+		// Late-initialize version only when digest is NOT specified
+		// When digest is specified, it's the source of truth and version becomes optional metadata
+		// This prevents spec pollution and GitOps drift in digest-only workflows
+		if cr.Spec.ForProvider.Chart.Version == "" && cr.Spec.ForProvider.Chart.Digest == "" {
+			cr.Spec.ForProvider.Chart.Version = chart.Metadata.Version
+			needsUpdate = true
+		}
+		// Note: When digest is used, the actual deployed version is stored in status.atProvider.version
+		// for observability, but the spec is not modified to avoid drift in GitOps workflows
 	}
-	if cr.Spec.ForProvider.Chart.Version == "" {
-		cr.Spec.ForProvider.Chart.Version = chart.Metadata.Version
+
+	if needsUpdate {
 		if err := e.localKube.Update(ctx, cr); err != nil {
-			return errors.Wrap(err, errFailedToSetVersion)
+			return errors.Wrap(err, errFailedToLateInitialize)
 		}
 	}
 
@@ -312,6 +339,12 @@ func (e *helmExternal) deploy(ctx context.Context, cr *v1beta1.Release, action d
 	}
 	cr.Status.PatchesSha = sha
 	cr.Status.AtProvider = generateObservation(rel)
+	// Store the digest in status for drift detection
+	cr.Status.AtProvider.Digest = cr.Spec.ForProvider.Chart.Digest
+	// Mark ownership as taken if TakeOwnership was used
+	if cr.Spec.ForProvider.TakeOwnership {
+		cr.Status.AtProvider.OwnershipTaken = true
+	}
 
 	return nil
 }

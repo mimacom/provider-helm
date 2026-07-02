@@ -3,7 +3,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.18.0
+    controller-gen.kubebuilder.io/version: v0.20.1
   name: releases.helm.m.crossplane.io
 spec:
   group: helm.m.crossplane.io
@@ -125,6 +125,13 @@ spec:
                   chart:
                     description: A ChartSpec defines the chart spec for a Release
                     properties:
+                      digest:
+                        description: |-
+                          Digest is the OCI image digest in the format "sha256:abc123..."
+                          Only supported for OCI registries. When specified, the chart will be pulled by digest.
+                          Can be used alone or in combination with Version. Optional.
+                        pattern: ^sha256:[a-f0-9]{64}$
+                        type: string
                       name:
                         description: Name of Helm chart, required if ChartSpec.URL
                           not set
@@ -150,14 +157,22 @@ spec:
                           and overrides others fields in the spec
                         type: string
                       version:
-                        description: Version of Helm chart, late initialized with
-                          latest version if not set
+                        description: |-
+                          Version of Helm chart. Optional when Digest is specified.
+                          If not set and Digest is not specified, gets late initialized with the latest available version.
+                          If not set and Digest is specified, version is NOT late initialized to avoid spec drift.
+                          The actual deployed version is always available in status.atProvider.version for observability.
                         type: string
                     type: object
                   insecureSkipTLSVerify:
                     description: InsecureSkipTLSVerify skips tls certificate checks
                       for the chart download
                     type: boolean
+                  maxHistory:
+                    default: 20
+                    description: MaxHistory limits the maximum number of revisions
+                      saved per release. Use 0 for no limit.
+                    type: integer
                   namespace:
                     description: |-
                       Namespace to install the release into.
@@ -249,6 +264,14 @@ spec:
                   skipCreateNamespace:
                     description: SkipCreateNamespace won't create the namespace for
                       the release. This requires the namespace to already exist.
+                    type: boolean
+                  takeOwnership:
+                    description: |-
+                      TakeOwnership ignores Helm ownership validation and adopts pre-existing releases.
+                      This is a ONE-TIME operation: after the first successful deployment, the flag is recorded
+                      in status.atProvider.ownershipTaken and subsequent reconciles use normal Helm validation.
+                      This prevents silent adoption of unrelated resources during chart upgrades.
+                      Use this field to migrate manually-deployed Helm releases into Crossplane management.
                     type: boolean
                   values:
                     type: object
@@ -365,12 +388,25 @@ spec:
               atProvider:
                 description: ReleaseObservation are the observable fields of a Release.
                 properties:
+                  digest:
+                    description: Digest is the last successfully deployed chart digest
+                      (for OCI charts only).
+                    type: string
+                  ownershipTaken:
+                    description: |-
+                      OwnershipTaken indicates that spec.forProvider.takeOwnership was used for initial adoption.
+                      Once set to true, subsequent reconciles use normal Helm validation instead of takeOwnership,
+                      preventing silent adoption of unrelated resources during upgrades.
+                    type: boolean
                   releaseDescription:
                     type: string
                   revision:
                     type: integer
                   state:
                     description: Status is the status of a release
+                    type: string
+                  version:
+                    description: Version is the actual deployed chart version.
                     type: string
                 type: object
               conditions:

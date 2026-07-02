@@ -23,10 +23,10 @@ import (
 
 	ecr "github.com/awslabs/amazon-ecr-credential-helper/ecr-login"
 	"github.com/chrismellard/docker-credential-acr-env/pkg/credhelper"
+	"github.com/crossplane/crossplane-runtime/v2/pkg/errors"
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/v1/google"
-	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -58,6 +58,19 @@ func normalizeRegistryURL(registryURL string) string {
 		ref = strings.TrimPrefix(ref, "https://")
 	case strings.HasPrefix(ref, "http://"):
 		ref = strings.TrimPrefix(ref, "http://")
+	}
+
+	// Strip digest (@sha256:...) if present
+	if idx := strings.Index(ref, "@"); idx != -1 {
+		ref = ref[:idx]
+	}
+
+	// Strip version/tag (:tag) if present, but be careful not to strip port numbers
+	// Only strip if there's a / before the :, indicating it's a tag not a port
+	if idx := strings.LastIndex(ref, ":"); idx != -1 {
+		if lastSlash := strings.LastIndex(ref, "/"); lastSlash > 0 && idx > lastSlash {
+			ref = ref[:idx]
+		}
 	}
 
 	return strings.TrimSuffix(ref, "/")
