@@ -26,14 +26,14 @@ GO_STATIC_PACKAGES = $(GO_PROJECT)/cmd/provider
 GO_LDFLAGS += -X $(GO_PROJECT)/pkg/version.Version=$(VERSION)
 GO_SUBDIRS += cmd pkg apis generate
 GO111MODULE = on
-GOLANGCILINT_VERSION = 2.13.1
+GOLANGCILINT_VERSION = 2.14.0
 
 -include build/makelib/golang.mk
 
 # ====================================================================================
 # Setup Kubernetes tools
 
-KIND_VERSION = v0.32.0
+KIND_VERSION = v0.33.0
 KIND_NODE_IMAGE_TAG ?= v1.24.0
 UPTEST_VERSION = v2.2.0
 CROSSPLANE_VERSION = 2.4.2
