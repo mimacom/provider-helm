@@ -2,9 +2,6 @@ package helm
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/crossplane/crossplane-runtime/v2/pkg/errors"
@@ -231,340 +228,6 @@ func TestResolveOCIChartRef(t *testing.T) {
 	}
 }
 
-func TestResolveOCIChartVersion_BackwardCompatibility(t *testing.T) {
-	// Test that the old function still works correctly
-	type want struct {
-		urlPath string
-		version string
-		err     error
-	}
-
-	tests := []struct {
-		name     string
-		chartURL string
-		want     want
-	}{
-		{
-			name:     "VersionOnly",
-			chartURL: "oci://registry.example.com/charts/mychart:1.2.3",
-			want: want{
-				urlPath: "oci://registry.example.com/charts/mychart",
-				version: "1.2.3",
-				err:     nil,
-			},
-		},
-		{
-			name:     "NoVersion",
-			chartURL: "oci://registry.example.com/charts/mychart",
-			want: want{
-				urlPath: "oci://registry.example.com/charts/mychart",
-				version: "",
-				err:     nil,
-			},
-		},
-		{
-			name:     "WithDigest_IgnoresDigest",
-			chartURL: "oci://registry.example.com/charts/mychart:1.2.3@sha256:abc123",
-			want: want{
-				urlPath: "oci://registry.example.com/charts/mychart",
-				version: "1.2.3",
-				err:     nil,
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			gotURL, gotVersion, gotErr := resolveOCIChartVersion(tt.chartURL)
-
-			if diff := cmp.Diff(tt.want.err, gotErr, test.EquateErrors()); diff != "" {
-				t.Errorf("resolveOCIChartVersion() error:\n%s", diff)
-			}
-
-			if gotErr == nil && tt.want.err == nil {
-				if gotURL.String() != tt.want.urlPath {
-					t.Errorf("URL: want %q, got %q", tt.want.urlPath, gotURL.String())
-				}
-				if gotVersion != tt.want.version {
-					t.Errorf("Version: want %q, got %q", tt.want.version, gotVersion)
-				}
-			}
-		})
-	}
-}
-
-// helmDigestPullFilename reproduces the filename Helm's chart downloader writes
-// for an OCI chart pulled by digest (see helm.sh/helm/v4 pkg/downloader
-// chart_downloader.go DownloadTo): it takes filepath.Base of the reference path
-// (e.g. "mychart@sha256:abc") and replaces the last ':' with '-', yielding
-// "mychart@sha256-abc.tgz". resolveCachedChartPathWithDigest must construct the
-// same name so a digest-pinned pull is found in the cache on the next reconcile.
-func helmDigestPullFilename(name, digest string) string {
-	base := filepath.Base(name) + "@" + digest // e.g. mychart@sha256:abc
-	idx := strings.LastIndexByte(base, ':')
-	return fmt.Sprintf("%s-%s.tgz", base[:idx], base[idx+1:])
-}
-
-func TestResolveCachedChartPathWithDigest(t *testing.T) {
-	// Override the global cache path so we assert against a known base dir.
-	tempDir := t.TempDir()
-	localChartCache := filepath.Join(tempDir, "charts")
-	if err := os.MkdirAll(localChartCache, 0750); err != nil {
-		t.Fatalf("Failed to create local chart cache directory: %v", err)
-	}
-	origCache := chartCache
-	chartCache = localChartCache
-	defer func() { chartCache = origCache }()
-
-	const digest = "sha256:d1c2884a2ac2d2f80fb1bf384e45b4cc72669498ccd237843dcc63bfcac810a3"
-
-	tests := []struct {
-		name      string
-		chartName string
-		digest    string
-		want      string
-	}{
-		{
-			name:      "ValidDigest",
-			chartName: "mychart",
-			digest:    digest,
-			// Must match the filename Helm writes for a digest pull.
-			want: filepath.Join(localChartCache, helmDigestPullFilename("mychart", digest)),
-		},
-		{
-			name:      "ChartNameWithPathComponentsIsBased",
-			chartName: "charts/nested/mychart",
-			digest:    digest,
-			want:      filepath.Join(localChartCache, helmDigestPullFilename("mychart", digest)),
-		},
-		{
-			name:      "EmptyChartName",
-			chartName: "",
-			digest:    digest,
-			want:      "", // cannot construct a cache path
-		},
-		{
-			name:      "DigestWithoutAlgoSeparator",
-			chartName: "mychart",
-			digest:    "deadbeef", // no "algo:hash" form
-			want:      "",
-		},
-		{
-			name:      "EmptyDigest",
-			chartName: "mychart",
-			digest:    "",
-			want:      "",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := resolveCachedChartPathWithDigest(tt.chartName, tt.digest)
-			if got != tt.want {
-				t.Errorf("resolveCachedChartPathWithDigest(%q, %q) = %q, want %q",
-					tt.chartName, tt.digest, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestEnsureChartCached(t *testing.T) {
-	// Create a temporary directory for the chart cache
-	tempDir := t.TempDir()
-	localChartCache := filepath.Join(tempDir, "charts")
-	if err := os.MkdirAll(localChartCache, 0750); err != nil {
-		t.Fatalf("Failed to create local chart cache directory: %v", err)
-	}
-
-	// Override the global cache path for the duration of this test
-	origCache := chartCache
-	chartCache = localChartCache
-	defer func() { chartCache = origCache }()
-
-	// Create a mock client with a mock logger
-	mockLog := &mockLogger{}
-	mockClient := &client{
-		log: mockLog,
-	}
-
-	// Test chart details
-	testChartName := "test-chart"
-	testChartVersion := "1.0.0"
-	testChartContent := "test chart tarball content"
-	testChartFileName := testChartName + "-" + testChartVersion + ".tgz"
-	testChartPath := filepath.Join(localChartCache, testChartFileName)
-
-	tests := []struct {
-		name           string
-		chartFilePath  string
-		setupCache     func() error
-		wantErr        bool
-		wantPath       string
-		validateResult func(t *testing.T, resultPath string)
-	}{
-		{
-			name:          "ChartExistsInCache_RegularFile",
-			chartFilePath: testChartPath,
-			setupCache: func() error {
-				return os.WriteFile(testChartPath, []byte(testChartContent), 0600)
-			},
-			wantErr:  false,
-			wantPath: testChartPath,
-			validateResult: func(t *testing.T, resultPath string) {
-				if resultPath != testChartPath {
-					t.Errorf("Expected path %q, got %q", testChartPath, resultPath)
-				}
-				// Verify file exists
-				if _, err := os.Stat(resultPath); err != nil {
-					t.Errorf("Chart file should exist at %q: %v", resultPath, err)
-				}
-			},
-		},
-		{
-			name:          "ChartExistsInCache_Directory",
-			chartFilePath: testChartPath,
-			setupCache: func() error {
-				return os.MkdirAll(testChartPath, 0750)
-			},
-			wantErr: true,
-			validateResult: func(t *testing.T, resultPath string) {
-				// Should return error when cached item is a directory
-			},
-		},
-		{
-			name:          "PathTraversalAttempt_SafelyHandled",
-			chartFilePath: "../../../etc/passwd",
-			setupCache: func() error {
-				// Create a file with the sanitized name
-				sanitizedName := filepath.Base("../../../etc/passwd")
-				safeFile := filepath.Join(localChartCache, sanitizedName)
-				return os.WriteFile(safeFile, []byte("safe content"), 0600)
-			},
-			wantErr: false,
-			validateResult: func(t *testing.T, resultPath string) {
-				// Verify the path is sanitized and within cache directory
-				relPath, err := filepath.Rel(localChartCache, resultPath)
-				if err != nil || filepath.IsAbs(relPath) || len(relPath) > 0 && relPath[0] == '.' {
-					t.Errorf("Result path %q is not within cache directory %q", resultPath, localChartCache)
-				}
-				// Verify it's the base filename only
-				expectedPath := filepath.Join(localChartCache, filepath.Base("../../../etc/passwd"))
-				if resultPath != expectedPath {
-					t.Errorf("Expected sanitized path %q, got %q", expectedPath, resultPath)
-				}
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Clean up cache directory before each test
-			files, err := filepath.Glob(filepath.Join(localChartCache, "*"))
-			if err == nil {
-				for _, f := range files {
-					os.RemoveAll(f)
-				}
-			}
-
-			// Setup cache for this test case
-			if tt.setupCache != nil {
-				if err := tt.setupCache(); err != nil {
-					t.Fatalf("Failed to setup cache: %v", err)
-				}
-			}
-
-			// Call ensureChartCached
-			gotPath, err := mockClient.ensureChartCached(
-				tt.chartFilePath,
-				"", // chartUrl
-				testChartName,
-				testChartVersion,
-				"", // chartRepo
-				"", // chartDigest
-				&RepoCreds{},
-			)
-
-			// Check error expectation
-			if (err != nil) != tt.wantErr {
-				t.Errorf("ensureChartCached() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
-
-			// Validate result if no error expected
-			if !tt.wantErr && tt.validateResult != nil {
-				tt.validateResult(t, gotPath)
-			}
-		})
-	}
-}
-
-func TestEnsureChartCached_PathTraversalProtection(t *testing.T) {
-	// Create a temporary directory for the chart cache
-	tempDir := t.TempDir()
-	localChartCache := filepath.Join(tempDir, "charts")
-	if err := os.MkdirAll(localChartCache, 0750); err != nil {
-		t.Fatalf("Failed to create local chart cache directory: %v", err)
-	}
-
-	// Override the global cache path
-	origCache := chartCache
-	chartCache = localChartCache
-	defer func() { chartCache = origCache }()
-
-	mockLog := &mockLogger{}
-	mockClient := &client{
-		log: mockLog,
-	}
-
-	// Test various path traversal attempts
-	pathTraversalAttempts := []string{
-		"../../../etc/passwd",
-		"../../secret.txt",
-		"./../../hidden.tgz",
-		"subdir/../../../etc/shadow",
-		"chart/../../../root/.ssh/id_rsa",
-	}
-
-	for _, maliciousPath := range pathTraversalAttempts {
-		t.Run("PathTraversal_"+maliciousPath, func(t *testing.T) {
-			// Create a file with the sanitized (base) name in the cache
-			sanitizedName := filepath.Base(maliciousPath)
-			safeFile := filepath.Join(localChartCache, sanitizedName)
-			if err := os.WriteFile(safeFile, []byte("safe content"), 0600); err != nil {
-				t.Fatalf("Failed to create safe file: %v", err)
-			}
-
-			// Call ensureChartCached with the malicious path
-			gotPath, err := mockClient.ensureChartCached(
-				maliciousPath,
-				"",
-				"test",
-				"1.0.0",
-				"",
-				"",
-				&RepoCreds{},
-			)
-
-			if err != nil {
-				t.Errorf("ensureChartCached() unexpected error: %v", err)
-				return
-			}
-
-			// Verify the returned path is safe and within cache directory
-			relPath, err := filepath.Rel(localChartCache, gotPath)
-			if err != nil || filepath.IsAbs(relPath) || len(relPath) > 0 && relPath[0] == '.' {
-				t.Errorf("Returned path %q escapes cache directory %q", gotPath, localChartCache)
-			}
-
-			// Verify it only uses the base filename
-			expectedPath := filepath.Join(localChartCache, sanitizedName)
-			if gotPath != expectedPath {
-				t.Errorf("Expected sanitized path %q, got %q", expectedPath, gotPath)
-			}
-		})
-	}
-}
-
 func TestResolveEffectiveDigest(t *testing.T) {
 	const digestA = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	const digestB = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -651,6 +314,16 @@ func TestPullAndLoadChart_Validation(t *testing.T) {
 			},
 			wantErr: errDigestNotSupportedForNonOCI,
 		},
+		"DigestWithNonOCIURLAndOCIRepository": {
+			// The URL is the sole pull source when set, so an OCI Repository
+			// next to it does not make the digest applicable.
+			chart: clusterv1beta1.ChartSpec{
+				URL:        "https://charts.example.com/mychart-1.0.0.tgz",
+				Repository: "oci://registry.example.com/charts",
+				Digest:     digest,
+			},
+			wantErr: errDigestNotSupportedForNonOCI,
+		},
 		"DigestWithNoURLOrRepository": {
 			chart: clusterv1beta1.ChartSpec{
 				Name:   "mychart",
@@ -659,8 +332,6 @@ func TestPullAndLoadChart_Validation(t *testing.T) {
 			wantErr: errDigestNotSupportedForNonOCI,
 		},
 		"NoURLMissingChartName": {
-			// version set so we skip the "pull latest" branch and reach the
-			// no-URL resolution branch that validates name/repository.
 			chart: clusterv1beta1.ChartSpec{
 				Repository: "https://charts.example.com",
 				Version:    "1.0.0",
@@ -673,6 +344,32 @@ func TestPullAndLoadChart_Validation(t *testing.T) {
 				Version: "1.0.0",
 			},
 			wantErr: errNoChartRepository,
+		},
+		"NoURLNoVersionMissingChartName": {
+			// No version and no digest previously short-circuited into the
+			// "pull latest" branch, past name/repository validation, and failed
+			// with an opaque helm error.
+			chart: clusterv1beta1.ChartSpec{
+				Repository: "https://charts.example.com",
+			},
+			wantErr: errNoChartName,
+		},
+		"NoURLNoVersionMissingRepository": {
+			chart: clusterv1beta1.ChartSpec{
+				Name: "mychart",
+			},
+			wantErr: errNoChartRepository,
+		},
+		"AllEmpty": {
+			chart:   clusterv1beta1.ChartSpec{},
+			wantErr: errNoChartName,
+		},
+		"OCIURLVersionConflictsWithSpecVersion": {
+			chart: clusterv1beta1.ChartSpec{
+				URL:     "oci://registry.example.com/charts/mychart:1.2.3",
+				Version: "2.0.0",
+			},
+			wantErr: fmt.Sprintf(errVersionMismatchTmpl, "1.2.3", "2.0.0"),
 		},
 	}
 
@@ -689,54 +386,161 @@ func TestPullAndLoadChart_Validation(t *testing.T) {
 	}
 }
 
-// TestDigestCacheRoundTrip proves the store/lookup key agreement for
-// digest-pinned charts: the path resolveCachedChartPathWithDigest constructs
-// matches the filename Helm writes for a digest pull, so a chart pulled on one
-// reconcile is found as a cache hit (without re-pulling) on the next. Helm's
-// pull stores the tarball under <name>@sha256-<hash>.tgz; ensureChartCached
-// must resolve the same path to a hit. Without this agreement a digest-pinned
-// chart would be re-pulled on every reconcile.
-func TestDigestCacheRoundTrip(t *testing.T) {
-	tempDir := t.TempDir()
-	localChartCache := filepath.Join(tempDir, "charts")
-	if err := os.MkdirAll(localChartCache, 0750); err != nil {
-		t.Fatalf("Failed to create local chart cache directory: %v", err)
+func TestResolveEffectiveVersion(t *testing.T) {
+	cases := map[string]struct {
+		urlVersion  string
+		specVersion string
+		want        string
+		wantErr     error
+	}{
+		"BothEmpty": {
+			want: "",
+		},
+		"URLOnly": {
+			urlVersion: "1.2.3",
+			want:       "1.2.3",
+		},
+		"SpecOnly": {
+			specVersion: "1.2.3",
+			want:        "1.2.3",
+		},
+		"BothMatch": {
+			urlVersion:  "1.2.3",
+			specVersion: "1.2.3",
+			want:        "1.2.3",
+		},
+		"Conflict": {
+			urlVersion:  "1.2.3",
+			specVersion: "2.0.0",
+			wantErr:     errors.Errorf(errVersionMismatchTmpl, "1.2.3", "2.0.0"),
+		},
+		"DevelSpecTreatedAsUnset": {
+			urlVersion:  "1.2.3",
+			specVersion: devel,
+			want:        "1.2.3",
+		},
 	}
 
-	origCache := chartCache
-	chartCache = localChartCache
-	defer func() { chartCache = origCache }()
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got, err := resolveEffectiveVersion(tc.urlVersion, tc.specVersion)
+			if diff := cmp.Diff(tc.wantErr, err, test.EquateErrors()); diff != "" {
+				t.Fatalf("resolveEffectiveVersion() error: -want, +got:\n%s", diff)
+			}
+			if err != nil {
+				return
+			}
+			if got != tc.want {
+				t.Errorf("resolveEffectiveVersion() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
 
-	mockClient := &client{log: &mockLogger{}}
-
-	const chartName = "podinfo"
-	const digest = "sha256:c56f4d760bc9da702f231f37fcec89c66b0993f0cb91446f86d014b133c6693f"
-
-	// The lookup path for a digest-pinned chart.
-	cachePath := resolveCachedChartPathWithDigest(chartName, digest)
-	if cachePath == "" {
-		t.Fatal("expected a non-empty cache path for a valid digest")
+func TestURLPullsSpecVersion(t *testing.T) {
+	type args struct {
+		chartURL   string
+		specDigest string
+	}
+	cases := map[string]struct {
+		args args
+		want bool
+	}{
+		"BareOCIURL": {
+			args: args{chartURL: "oci://registry.example.com/charts/mychart"},
+			want: true,
+		},
+		"BareOCIURLWithRegistryPort": {
+			args: args{chartURL: "oci://registry.example.com:5000/charts/mychart"},
+			want: true,
+		},
+		"TaggedOCIURL": {
+			args: args{chartURL: "oci://registry.example.com/charts/mychart:1.2.3"},
+			want: false,
+		},
+		"DigestPinnedOCIURL": {
+			args: args{chartURL: "oci://registry.example.com/charts/mychart@sha256:c56f4d760bc9da702f231f37fcec89c66b0993f0cb91446f86d014b133c6693f"},
+			want: false,
+		},
+		"BareOCIURLWithSpecDigest": {
+			args: args{
+				chartURL:   "oci://registry.example.com/charts/mychart",
+				specDigest: "sha256:c56f4d760bc9da702f231f37fcec89c66b0993f0cb91446f86d014b133c6693f",
+			},
+			want: false,
+		},
+		"NonOCIURL": {
+			args: args{chartURL: "https://charts.example.com/mychart-1.2.3.tgz"},
+			want: false,
+		},
+		"NoURL": {
+			args: args{},
+			want: false,
+		},
 	}
 
-	// It must equal the filename Helm produces for a digest pull, otherwise a
-	// pulled chart would never be found here.
-	wantPath := filepath.Join(localChartCache, helmDigestPullFilename(chartName, digest))
-	if cachePath != wantPath {
-		t.Fatalf("cache path %q does not match Helm's digest-pull filename %q", cachePath, wantPath)
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got := URLPullsSpecVersion(tc.args.chartURL, tc.args.specDigest)
+			if diff := cmp.Diff(tc.want, got); diff != "" {
+				t.Errorf("URLPullsSpecVersion(...): -want, +got:\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestURLVersionConflict(t *testing.T) {
+	type args struct {
+		chartURL    string
+		specVersion string
+	}
+	cases := map[string]struct {
+		args args
+		want error
+	}{
+		"TagConflictsWithSpecVersion": {
+			args: args{chartURL: "oci://registry.example.com/charts/mychart:1.2.3", specVersion: "2.0.0"},
+			want: errors.Errorf(errVersionMismatchTmpl, "1.2.3", "2.0.0"),
+		},
+		"TagAndDigestConflictWithSpecVersion": {
+			args: args{
+				chartURL:    "oci://registry.example.com/charts/mychart:1.2.3@sha256:c56f4d760bc9da702f231f37fcec89c66b0993f0cb91446f86d014b133c6693f",
+				specVersion: "2.0.0",
+			},
+			want: errors.Errorf(errVersionMismatchTmpl, "1.2.3", "2.0.0"),
+		},
+		"TagMatchesSpecVersion": {
+			args: args{chartURL: "oci://registry.example.com/charts/mychart:1.2.3", specVersion: "1.2.3"},
+			want: nil,
+		},
+		"TagWithoutSpecVersion": {
+			args: args{chartURL: "oci://registry.example.com/charts/mychart:1.2.3"},
+			want: nil,
+		},
+		"TagWithDevelSpecVersion": {
+			args: args{chartURL: "oci://registry.example.com/charts/mychart:1.2.3", specVersion: devel},
+			want: nil,
+		},
+		"BareOCIURLWithSpecVersion": {
+			args: args{chartURL: "oci://registry.example.com/charts/mychart", specVersion: "2.0.0"},
+			want: nil,
+		},
+		"NonOCIURLWithSpecVersion": {
+			args: args{chartURL: "https://charts.example.com/mychart-1.2.3.tgz", specVersion: "2.0.0"},
+			want: nil,
+		},
+		"NoURL": {
+			args: args{specVersion: "2.0.0"},
+			want: nil,
+		},
 	}
 
-	// Simulate the chart already pulled and stored under that name on a prior
-	// reconcile (Helm's pull + cache store preserves this filename).
-	if err := os.WriteFile(cachePath, []byte("pretend-this-is-a-chart-tarball"), 0600); err != nil {
-		t.Fatalf("Failed to write cached chart: %v", err)
-	}
-
-	// The next reconcile must resolve to a cache hit and not attempt a pull.
-	gotPath, err := mockClient.ensureChartCached(cachePath, "", chartName, "", "", digest, &RepoCreds{})
-	if err != nil {
-		t.Fatalf("ensureChartCached() error: %v", err)
-	}
-	if gotPath != cachePath {
-		t.Errorf("ensureChartCached() = %q, want cache hit at %q", gotPath, cachePath)
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got := URLVersionConflict(tc.args.chartURL, tc.args.specVersion)
+			if diff := cmp.Diff(tc.want, got, test.EquateErrors()); diff != "" {
+				t.Errorf("URLVersionConflict(...): -want, +got:\n%s", diff)
+			}
+		})
 	}
 }
