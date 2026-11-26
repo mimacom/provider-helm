@@ -42,12 +42,14 @@ type conversionData struct {
 	SkipCreateNamespace   bool                       `json:"skipCreateNamespace,omitempty"`
 	WaitTimeout           *metav1.Duration           `json:"waitTimeout,omitempty"`
 	SkipCRDs              bool                       `json:"skipCRDs,omitempty"`
+	SkipSchemaValidation  bool                       `json:"skipSchemaValidation,omitempty"`
 	InsecureSkipTLSVerify bool                       `json:"insecureSkipTLSVerify,omitempty"`
 	PlainHTTP             bool                       `json:"plainHTTP,omitempty"`
 	CABundle              *v1beta1.ValueFromSource   `json:"caBundle,omitempty"`
 	TakeOwnership         bool                       `json:"takeOwnership,omitempty"`
 	MaxHistory            int                        `json:"maxHistory,omitempty"`
 	SSAForceConflicts     bool                       `json:"ssaForceConflicts,omitempty"`
+	Labels                map[string]string          `json:"labels,omitempty"`
 	ConnectionDetails     []v1beta1.ConnectionDetail `json:"connectionDetails,omitempty"`
 	ObservedDigest        string                     `json:"observedDigest,omitempty"`
 	ObservedVersion       string                     `json:"observedVersion,omitempty"`
@@ -90,12 +92,14 @@ func (src *Release) ConvertTo(dstRaw conversion.Hub) error {
 	dst.Spec.ForProvider.SkipCreateNamespace = cd.SkipCreateNamespace
 	dst.Spec.ForProvider.WaitTimeout = cd.WaitTimeout
 	dst.Spec.ForProvider.SkipCRDs = cd.SkipCRDs
+	dst.Spec.ForProvider.SkipSchemaValidation = cd.SkipSchemaValidation
 	dst.Spec.ForProvider.InsecureSkipTLSVerify = cd.InsecureSkipTLSVerify
 	dst.Spec.ForProvider.PlainHTTP = cd.PlainHTTP
 	dst.Spec.ForProvider.CABundle = cd.CABundle
 	dst.Spec.ForProvider.TakeOwnership = cd.TakeOwnership
 	dst.Spec.ForProvider.MaxHistory = cd.MaxHistory
 	dst.Spec.ForProvider.SSAForceConflicts = cd.SSAForceConflicts
+	dst.Spec.ForProvider.Labels = cd.Labels
 	dst.Spec.ConnectionDetails = cd.ConnectionDetails
 	dst.Status.AtProvider.Digest = cd.ObservedDigest
 	dst.Status.AtProvider.Version = cd.ObservedVersion
@@ -129,12 +133,14 @@ func (dst *Release) ConvertFrom(srcRaw conversion.Hub) error {
 		SkipCreateNamespace:   src.Spec.ForProvider.SkipCreateNamespace,
 		WaitTimeout:           src.Spec.ForProvider.WaitTimeout,
 		SkipCRDs:              src.Spec.ForProvider.SkipCRDs,
+		SkipSchemaValidation:  src.Spec.ForProvider.SkipSchemaValidation,
 		InsecureSkipTLSVerify: src.Spec.ForProvider.InsecureSkipTLSVerify,
 		PlainHTTP:             src.Spec.ForProvider.PlainHTTP,
 		CABundle:              src.Spec.ForProvider.CABundle,
 		TakeOwnership:         src.Spec.ForProvider.TakeOwnership,
 		MaxHistory:            src.Spec.ForProvider.MaxHistory,
 		SSAForceConflicts:     src.Spec.ForProvider.SSAForceConflicts,
+		Labels:                src.Spec.ForProvider.Labels,
 		ConnectionDetails:     src.Spec.ConnectionDetails,
 		ObservedDigest:        src.Status.AtProvider.Digest,
 		ObservedVersion:       src.Status.AtProvider.Version,
